@@ -1,2 +1,8 @@
 .env
 backend/data/
+backend/processed/**
+!backend/processed/.gitkeep
+backend/.venv/
+**/__pycache__/
+*.pyc
+.DS_Store

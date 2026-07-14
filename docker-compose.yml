@@ -1,0 +1,20 @@
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aims-rdr-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_ROOT: /app/data
+      PROCESSED_ROOT: /app/processed
+      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+    volumes:
+      # Raw survey packages (TIF/ECW/SHP/CSV) — read-only
+      - ./backend/data:/app/data:ro
+      # Generated JSON + previews for the frontend
+      - ./backend/processed:/app/processed
+      # Live app code (avoids rebuild for Python changes)
+      - ./backend/app:/app/app
+    restart: unless-stopped
