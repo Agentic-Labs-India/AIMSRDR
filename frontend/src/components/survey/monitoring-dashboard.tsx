@@ -5,11 +5,11 @@ import {
   AlertTriangle,
   Box,
   Download,
+  FileText,
   Layers3,
   Map as MapIcon,
   RefreshCw,
   Satellite,
-  TriangleAlert,
 } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
@@ -23,11 +23,14 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   fetchComparison,
+  fetchPatioVolumeReport,
   fetchProcessJob,
   fetchSite,
   getApiBase,
   mediaUrl,
+  patioVolumePdfUrl,
   startProcessJob,
+  type PatioVolumeReportBundle,
 } from "@/lib/api";
 import { formatDate, formatNumber } from "@/lib/format";
 import type { Comparison, ProcessJobStatus, Site, Survey } from "@/lib/types";
@@ -52,7 +55,7 @@ const NAV: { id: Section; label: string; href: string; icon: typeof Activity }[]
   { id: "dem", label: "DEM / TIF", href: "/monitor/dem", icon: MapIcon },
   { id: "change", label: "Change Detection", href: "/monitor/change", icon: Layers3 },
   { id: "ortho", label: "Ortho Imagery", href: "/monitor/ortho", icon: Satellite },
-  { id: "parameters", label: "Parameters / Defects", href: "/monitor/parameters", icon: TriangleAlert },
+  { id: "parameters", label: "Patio Volumes", href: "/monitor/parameters", icon: FileText },
 ];
 
 function MetaCard({
@@ -115,13 +118,13 @@ export function MonitoringDashboard({
   const isRoad = initialSite.asset_type === "road";
 
   const [site, setSite] = useState(initialSite);
-  const [mode, setMode] = useState<Mode>(
-    section === "change" || section === "parameters" ? "compare" : "inspect",
-  );
+  const [mode, setMode] = useState<Mode>(section === "change" ? "compare" : "inspect");
   const [inspectId, setInspectId] = useState(primaryFrom);
   const [compareFrom, setCompareFrom] = useState(primaryFrom);
   const [compareTo, setCompareTo] = useState(primaryTo);
   const [comparison, setComparison] = useState<Comparison | null>(null);
+  const [patioReport, setPatioReport] = useState<PatioVolumeReportBundle | null>(null);
+  const [patioBusy, setPatioBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [exaggeration, setExaggeration] = useState(3);
@@ -137,13 +140,12 @@ export function MonitoringDashboard({
   const toSurvey = surveys.find((s) => s.id === compareTo);
 
   useEffect(() => {
-    if (section === "change" || section === "parameters") {
-      setMode("compare");
-    }
+    if (section === "change") setMode("compare");
+    if (section === "parameters") setMode("inspect");
   }, [section]);
 
   useEffect(() => {
-    if (mode !== "compare" && section !== "change" && section !== "parameters") return;
+    if (mode !== "compare" && section !== "change") return;
     let cancelled = false;
     async function load() {
       try {
@@ -161,6 +163,50 @@ export function MonitoringDashboard({
       cancelled = true;
     };
   }, [mode, section, site.id, compareFrom, compareTo]);
+
+  useEffect(() => {
+    if (section !== "parameters" || !survey?.id) return;
+    let cancelled = false;
+    async function load() {
+      setPatioBusy(true);
+      try {
+        const report = await fetchPatioVolumeReport(site.id, survey.id, false);
+        if (!cancelled) {
+          setPatioReport(report);
+          setMessage(null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setPatioReport(null);
+          setMessage(err instanceof Error ? err.message : "Patio volume report failed");
+        }
+      } finally {
+        if (!cancelled) setPatioBusy(false);
+      }
+    }
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [section, site.id, survey?.id]);
+
+  async function generatePatioPdf(force = true) {
+    if (!survey?.id) return;
+    setPatioBusy(true);
+    setMessage("Generating patio volume PDF…");
+    try {
+      const report = await fetchPatioVolumeReport(site.id, survey.id, force);
+      setPatioReport(report);
+      setMessage(
+        `Patio volume PDF ready · ${formatNumber(report.summary.total_volume_m3, 0)} m³ across ${report.summary.pile_count} piles`,
+      );
+      window.open(patioVolumePdfUrl(site.id, survey.id, false), "_blank");
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "PDF generation failed");
+    } finally {
+      setPatioBusy(false);
+    }
+  }
 
   async function refresh() {
     setBusy(true);
@@ -274,8 +320,6 @@ export function MonitoringDashboard({
   const showOrtho = section === "dashboard" || section === "ortho";
   const showDem = section === "dashboard" || section === "dem";
   const showParameters = section === "parameters";
-  const defectSummary = comparison?.dod?.defects?.summary;
-  const defectFeatures = comparison?.dod?.defects?.features ?? [];
 
   return (
     <div className="min-h-screen bg-[#0b1220] text-slate-100">
@@ -449,18 +493,20 @@ export function MonitoringDashboard({
                   hint="DEM pixel size"
                 />
                 <MetaCard
-                  label={isRoad ? "Pothole candidates" : "Surface depressions"}
+                  label={isRoad ? "Surface depressions" : "Named piles"}
                   value={
-                    defectSummary?.pothole_candidates != null
-                      ? String(defectSummary.pothole_candidates)
-                      : dodStats?.pothole_candidates != null
-                        ? String(dodStats.pothole_candidates)
-                        : "—"
+                    survey.summary.named_pile_count != null
+                      ? String(survey.summary.named_pile_count)
+                      : survey.summary.pile_count != null
+                        ? String(survey.summary.pile_count)
+                        : dodStats?.pothole_candidates != null
+                          ? String(dodStats.pothole_candidates)
+                          : "—"
                   }
                   hint={
-                    defectSummary?.max_pothole_depth_m != null
-                      ? `Max depth ${formatNumber(defectSummary.max_pothole_depth_m, 2)} m`
-                      : "From DoD compare"
+                    survey.summary.net_volume_m3 != null
+                      ? `Net ${formatNumber(survey.summary.net_volume_m3, 0)} m³`
+                      : "Patio stockpiles / DoD"
                   }
                 />
               </div>
@@ -777,171 +823,148 @@ export function MonitoringDashboard({
             {showParameters ? (
               <div className="space-y-4">
                 <Card className="border-white/10 bg-[#0f172a] text-slate-100">
-                  <CardHeader>
-                    <CardTitle className="text-white">
-                      {isRoad ? "Road surface parameters" : "Survey & surface parameters"}
-                    </CardTitle>
-                    <CardDescription className="text-slate-400">
-                      DEM/ortho metadata plus DoD-derived defect candidates
-                      {isRoad
-                        ? " (potholes, ruts, heave)."
-                        : " (depressions map to pothole-class features for road assets)."}
-                    </CardDescription>
+                  <CardHeader className="flex flex-row items-start justify-between gap-3">
+                    <div>
+                      <CardTitle className="text-white">
+                        Calculation of Loose Coal Volumes
+                      </CardTitle>
+                      <CardDescription className="text-slate-400">
+                        Coal patio stockpiles (not road potholes). Named piles NC_CY*, product
+                        class, chainage, height, angle of repose — MatrixGeo-style PDF.
+                      </CardDescription>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="shrink-0 border-white/30 bg-transparent text-foreground hover:bg-white/10"
+                      disabled={patioBusy || !survey?.id}
+                      onClick={() => void generatePatioPdf(true)}
+                    >
+                      <Download className="mr-2 size-4" />
+                      {patioBusy ? "Building…" : "Generate PDF"}
+                    </Button>
                   </CardHeader>
                   <CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                     <MetaCard
-                      label="Asset type"
-                      value={site.asset_type}
-                      hint={site.crs}
+                      label="Survey"
+                      value={survey ? formatDate(survey.date) : "—"}
+                      hint={patioReport?.summary.source_stage ?? survey?.id}
                     />
                     <MetaCard
-                      label="DEM GSD"
+                      label="Named piles"
+                      value={String(patioReport?.summary.pile_count ?? "—")}
+                    />
+                    <MetaCard
+                      label="Total net volume"
                       value={
-                        survey?.summary.gsd_cm != null
-                          ? `${formatNumber(survey.summary.gsd_cm, 1)} cm`
+                        patioReport?.summary.total_volume_m3 != null
+                          ? `${formatNumber(patioReport.summary.total_volume_m3, 0)} m³`
                           : "—"
                       }
                     />
                     <MetaCard
-                      label="Ortho GSD"
+                      label="Patio A / B / C"
                       value={
-                        typeof rasters?.ortho_metadata?.gsd_cm === "number"
-                          ? `${formatNumber(rasters.ortho_metadata.gsd_cm as number, 1)} cm`
+                        patioReport
+                          ? `${formatNumber(patioReport.summary.totals_by_patio.A ?? 0, 0)} / ${formatNumber(patioReport.summary.totals_by_patio.B ?? 0, 0)} / ${formatNumber(patioReport.summary.totals_by_patio.C ?? 0, 0)}`
                           : "—"
                       }
-                    />
-                    <MetaCard
-                      label="Elev range"
-                      value={
-                        elev?.minimum != null && elev?.maximum != null
-                          ? `${formatNumber(elev.minimum, 2)}–${formatNumber(elev.maximum, 2)} m`
-                          : "—"
-                      }
-                    />
-                    <MetaCard
-                      label={isRoad ? "Potholes" : "Depressions"}
-                      value={String(defectSummary?.pothole_candidates ?? dodStats?.pothole_candidates ?? "—")}
-                      hint={
-                        defectSummary?.mean_pothole_depth_m != null
-                          ? `Mean depth ${formatNumber(defectSummary.mean_pothole_depth_m, 2)} m`
-                          : undefined
-                      }
-                    />
-                    <MetaCard
-                      label="Ruts"
-                      value={String(defectSummary?.rut_candidates ?? dodStats?.rut_candidates ?? "—")}
-                    />
-                    <MetaCard
-                      label="Heave / patches"
-                      value={String(defectSummary?.heave_candidates ?? dodStats?.heave_candidates ?? "—")}
-                    />
-                    <MetaCard
-                      label="Max depression"
-                      value={
-                        defectSummary?.max_pothole_depth_m != null
-                          ? `${formatNumber(defectSummary.max_pothole_depth_m, 2)} m`
-                          : dodStats?.min_m != null
-                            ? `${formatNumber(Math.abs(dodStats.min_m), 2)} m`
-                            : "—"
-                      }
-                    />
-                    <MetaCard
-                      label="Cut volume"
-                      value={
-                        dodStats?.cut_volume_m3_approx != null
-                          ? `${formatNumber(dodStats.cut_volume_m3_approx, 0)} m³`
-                          : "—"
-                      }
-                    />
-                    <MetaCard
-                      label="Fill volume"
-                      value={
-                        dodStats?.fill_volume_m3_approx != null
-                          ? `${formatNumber(dodStats.fill_volume_m3_approx, 0)} m³`
-                          : "—"
-                      }
-                    />
-                    <MetaCard
-                      label="DEM file"
-                      value={
-                        survey?.assets?.dtm?.bytes != null
-                          ? `${formatNumber(survey.assets.dtm.bytes / 1_000_000, 1)} MB`
-                          : "—"
-                      }
-                      hint={survey?.assets?.dtm?.path ?? undefined}
-                    />
-                    <MetaCard
-                      label="Ortho file"
-                      value={
-                        survey?.assets?.ortho?.bytes != null
-                          ? `${formatNumber(survey.assets.ortho.bytes / 1_000_000, 1)} MB`
-                          : "—"
-                      }
-                      hint={rasters?.ortho_status ?? undefined}
+                      hint="m³"
                     />
                   </CardContent>
                 </Card>
 
-                <Card className="border-white/10 bg-[#0f172a] text-slate-100">
-                  <CardHeader>
-                    <CardTitle className="text-white">
-                      {isRoad ? "Pothole & defect list" : "Surface defect candidates"}
-                    </CardTitle>
-                    <CardDescription className="text-slate-400">
-                      Local extrema from DEM of Difference ({formatDate(fromSurvey?.date ?? "")} →{" "}
-                      {formatDate(toSurvey?.date ?? "")}). Thresholds: depression ≤ −8 cm, heave ≥ +8 cm.
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    {defectFeatures.length ? (
-                      <div className="overflow-x-auto rounded-lg border border-white/10">
-                        <table className="min-w-full text-left text-xs text-slate-200">
-                          <thead className="bg-white/5 text-[11px] uppercase tracking-wide text-slate-400">
-                            <tr>
-                              <th className="px-3 py-2">ID</th>
-                              <th className="px-3 py-2">Type</th>
-                              <th className="px-3 py-2">Severity</th>
-                              <th className="px-3 py-2">Depth (m)</th>
-                              <th className="px-3 py-2">Area (m²)</th>
-                              <th className="px-3 py-2">Easting</th>
-                              <th className="px-3 py-2">Northing</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {defectFeatures.slice(0, 40).map((f) => (
-                              <tr key={f.id} className="border-t border-white/10">
-                                <td className="px-3 py-2 font-mono text-[11px]">{f.id}</td>
-                                <td className="px-3 py-2 capitalize">{f.type}</td>
-                                <td className="px-3 py-2 capitalize">{f.severity}</td>
-                                <td className="px-3 py-2 tabular-nums">
-                                  {f.depth_m != null ? formatNumber(f.depth_m, 3) : "—"}
-                                </td>
-                                <td className="px-3 py-2 tabular-nums">
-                                  {f.area_m2_approx != null ? formatNumber(f.area_m2_approx, 1) : "—"}
-                                </td>
-                                <td className="px-3 py-2 tabular-nums">
-                                  {f.easting != null ? formatNumber(f.easting, 2) : "—"}
-                                </td>
-                                <td className="px-3 py-2 tabular-nums">
-                                  {f.northing != null ? formatNumber(f.northing, 2) : "—"}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    ) : (
-                      <p className="text-sm text-slate-400">
-                        No defect candidates yet. Open Compare dates (or this page loads the primary
-                        pair) and ensure DoD has been processed.
-                      </p>
-                    )}
-                  </CardContent>
-                </Card>
+                {patioReport
+                  ? Object.entries(patioReport.data.patios)
+                      .sort(([a], [b]) => a.localeCompare(b))
+                      .map(([patio, block]) => (
+                        <Card
+                          key={patio}
+                          className="border-white/10 bg-[#0f172a] text-slate-100"
+                        >
+                          <CardHeader>
+                            <CardTitle className="text-white">
+                              PATIO {patio} · {formatNumber(block.total_volume_m3, 2)} m³
+                            </CardTitle>
+                            <CardDescription className="text-slate-400">
+                              {block.pile_count} piles · deep morphometric product classification
+                            </CardDescription>
+                          </CardHeader>
+                          <CardContent>
+                            <div className="overflow-x-auto rounded-lg border border-white/10">
+                              <table className="min-w-full text-left text-xs text-slate-200">
+                                <thead className="bg-white/5 text-[11px] uppercase tracking-wide text-slate-400">
+                                  <tr>
+                                    <th className="px-3 py-2">Pile</th>
+                                    <th className="px-3 py-2">Date</th>
+                                    <th className="px-3 py-2">Net Vol (m³)</th>
+                                    <th className="px-3 py-2">Area (ha)</th>
+                                    <th className="px-3 py-2">Chainage</th>
+                                    <th className="px-3 py-2">Product</th>
+                                    <th className="px-3 py-2">Max H (m)</th>
+                                    <th className="px-3 py-2">Repose (°)</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {block.piles.map((p) => (
+                                    <tr
+                                      key={p.pile_name}
+                                      className="border-t border-white/10"
+                                    >
+                                      <td className="px-3 py-2 font-mono text-[11px]">
+                                        {p.pile_name}
+                                      </td>
+                                      <td className="px-3 py-2">{p.date_of_survey}</td>
+                                      <td className="px-3 py-2 tabular-nums">
+                                        {formatNumber(p.net_volume_m3, 2)}
+                                      </td>
+                                      <td className="px-3 py-2 tabular-nums">
+                                        {p.enclosed_area_ha != null
+                                          ? formatNumber(p.enclosed_area_ha, 3)
+                                          : "—"}
+                                      </td>
+                                      <td className="px-3 py-2 tabular-nums">{p.chainage}</td>
+                                      <td className="px-3 py-2">{p.product}</td>
+                                      <td className="px-3 py-2 tabular-nums">
+                                        {p.maximum_height_m != null
+                                          ? formatNumber(p.maximum_height_m, 4)
+                                          : "—"}
+                                      </td>
+                                      <td className="px-3 py-2 tabular-nums">
+                                        {p.avg_angle_of_repose_deg != null
+                                          ? formatNumber(p.avg_angle_of_repose_deg, 2)
+                                          : "—"}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                  <tr className="border-t border-white/20 bg-white/5 font-semibold">
+                                    <td className="px-3 py-2" colSpan={2}>
+                                      Total Volume
+                                    </td>
+                                    <td className="px-3 py-2 tabular-nums">
+                                      {formatNumber(block.total_volume_m3, 2)}
+                                    </td>
+                                    <td className="px-3 py-2" colSpan={5} />
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </div>
+                          </CardContent>
+                        </Card>
+                      ))
+                  : (
+                    <Card className="border-white/10 bg-[#0f172a] text-slate-100">
+                      <CardContent className="py-8 text-sm text-slate-400">
+                        {patioBusy
+                          ? "Loading patio volume classification…"
+                          : "No patio volume data yet. Ensure stage pile polygons and volume JSON exist under processed/."}
+                      </CardContent>
+                    </Card>
+                  )}
               </div>
             ) : null}
 
-            {(showChange || showParameters) && comparison ? (
+            {showChange && comparison ? (
               <Card className="border-white/10 bg-[#0f172a] text-slate-100">
                 <CardHeader>
                   <CardTitle className="text-white">Comparison notes</CardTitle>

@@ -2,7 +2,7 @@
 
 import { OrbitControls } from "@react-three/drei";
 import { Canvas } from "@react-three/fiber";
-import { Component, type ReactNode, Suspense, useEffect, useMemo, useState } from "react";
+import { Component, type ReactNode, Suspense, useEffect, useState } from "react";
 import * as THREE from "three";
 
 type ViewMode = "points" | "mesh";
@@ -51,22 +51,6 @@ function loadImage(url: string): Promise<HTMLImageElement> {
   });
 }
 
-function loadTexture(url: string): Promise<THREE.Texture> {
-  return new Promise((resolve, reject) => {
-    const loader = new THREE.TextureLoader();
-    loader.setCrossOrigin("anonymous");
-    loader.load(
-      url,
-      (texture) => {
-        texture.needsUpdate = true;
-        resolve(texture);
-      },
-      undefined,
-      () => reject(new Error(`Failed to load texture: ${url}`)),
-    );
-  });
-}
-
 function sampleImageData(img: HTMLImageElement): ImageData {
   const canvas = document.createElement("canvas");
   canvas.width = img.naturalWidth || img.width;
@@ -106,7 +90,8 @@ function PointCloudDem({
   textureUrl,
   hillshadeUrl,
   displacementScale = 8,
-}: DemTerrainProps) {
+  onStatus,
+}: DemTerrainProps & { onStatus?: (status: string | null) => void }) {
   const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -117,6 +102,7 @@ function PointCloudDem({
     async function run() {
       setError(null);
       setGeometry(null);
+      onStatus?.("Loading DEM point cloud…");
       try {
         const heightImg = await loadImage(heightmapUrl);
         const shadeImg = hillshadeUrl
@@ -186,10 +172,15 @@ function PointCloudDem({
         geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
         geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
         geo.computeBoundingSphere();
-        if (!cancelled) setGeometry(geo);
+        if (!cancelled) {
+          setGeometry(geo);
+          onStatus?.(null);
+        }
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Point cloud failed");
+          const msg = err instanceof Error ? err.message : "Point cloud failed";
+          setError(msg);
+          onStatus?.(msg);
         }
       }
     }
@@ -199,7 +190,7 @@ function PointCloudDem({
       cancelled = true;
       geo?.dispose();
     };
-  }, [heightmapUrl, textureUrl, hillshadeUrl, displacementScale]);
+  }, [heightmapUrl, textureUrl, hillshadeUrl, displacementScale, onStatus]);
 
   if (error || !geometry) return null;
 
@@ -221,38 +212,119 @@ function TerrainMesh({
   textureUrl,
   hillshadeUrl,
   displacementScale = 8,
-}: DemTerrainProps) {
-  const [heightMap, setHeightMap] = useState<THREE.Texture | null>(null);
-  const [colorMap, setColorMap] = useState<THREE.Texture | null>(null);
+  onStatus,
+}: DemTerrainProps & { onStatus?: (status: string | null) => void }) {
+  const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    const textures: THREE.Texture[] = [];
+    let geo: THREE.BufferGeometry | null = null;
 
     async function run() {
-      setHeightMap(null);
-      setColorMap(null);
+      setError(null);
+      setGeometry(null);
+      onStatus?.("Building DEM mesh…");
       try {
-        const height = await loadTexture(heightmapUrl);
-        height.colorSpace = THREE.NoColorSpace;
-        height.wrapS = height.wrapT = THREE.ClampToEdgeWrapping;
-        textures.push(height);
+        // Build mesh from DEM samples (same source as point cloud).
+        // GPU displacementMap + remote textures was failing silently in Mesh mode.
+        const heightImg = await loadImage(heightmapUrl);
+        const shadeImg = hillshadeUrl
+          ? await loadImage(hillshadeUrl).catch(() => null)
+          : null;
+        const colorImg = textureUrl
+          ? await loadImage(textureUrl).catch(() => null)
+          : null;
 
-        // Prefer ortho imagery; else hillshade (natural gray), never heatmap.
-        const preferred = textureUrl || hillshadeUrl || heightmapUrl;
-        const color = await loadTexture(preferred);
-        color.colorSpace = THREE.SRGBColorSpace;
-        color.wrapS = color.wrapT = THREE.ClampToEdgeWrapping;
-        textures.push(color);
+        if (cancelled) return;
 
-        if (!cancelled) {
-          setHeightMap(height);
-          setColorMap(color);
+        const height = sampleImageData(heightImg);
+        const shade = shadeImg ? sampleImageData(shadeImg) : null;
+        const color = colorImg ? sampleImageData(colorImg) : null;
+
+        const w = height.width;
+        const h = height.height;
+        const aspect = w / Math.max(h, 1);
+        const planeW = 120 * aspect;
+        const planeH = 120;
+
+        // ~180×180 grid keeps mesh responsive while preserving patio relief.
+        const segs = 180;
+        const positions: number[] = [];
+        const colors: number[] = [];
+        const normals: number[] = [];
+        const indices: number[] = [];
+        const elevGrid: number[] = [];
+
+        for (let j = 0; j <= segs; j++) {
+          for (let i = 0; i <= segs; i++) {
+            const u = i / segs;
+            const v = j / segs;
+            const x = Math.min(w - 1, Math.floor(u * (w - 1)));
+            const y = Math.min(h - 1, Math.floor(v * (h - 1)));
+            const pi = (y * w + x) * 4;
+            const elevByte = height.data[pi];
+            const height01 = elevByte < 3 ? 0 : elevByte / 255;
+            elevGrid.push(height01);
+
+            const px = (u - 0.5) * planeW;
+            const pz = (v - 0.5) * planeH;
+            const py = (height01 - 0.45) * displacementScale;
+
+            const shade01 = shade ? shade.data[pi] / 255 : 0.65 + 0.35 * height01;
+            let tex: [number, number, number] | undefined;
+            if (color) {
+              const cx = Math.min(color.width - 1, Math.floor(u * (color.width - 1)));
+              const cy = Math.min(color.height - 1, Math.floor(v * (color.height - 1)));
+              const ci = (cy * color.width + cx) * 4;
+              if (color.data[ci] + color.data[ci + 1] + color.data[ci + 2] > 24) {
+                tex = [color.data[ci], color.data[ci + 1], color.data[ci + 2]];
+              }
+            }
+            const [r, g, b] = naturalColor(height01, shade01, tex);
+
+            positions.push(px, py, pz);
+            colors.push(r, g, b);
+            normals.push(0, 1, 0);
+          }
         }
-      } catch {
+
+        const stride = segs + 1;
+        for (let j = 0; j < segs; j++) {
+          for (let i = 0; i < segs; i++) {
+            const a = j * stride + i;
+            const b = a + 1;
+            const c = a + stride;
+            const d = c + 1;
+            // Skip quads that are entirely nodata (flat black)
+            const e0 = elevGrid[a];
+            const e1 = elevGrid[b];
+            const e2 = elevGrid[c];
+            const e3 = elevGrid[d];
+            if (e0 + e1 + e2 + e3 < 0.02) continue;
+            indices.push(a, c, b, b, c, d);
+          }
+        }
+
+        if (indices.length < 30) {
+          throw new Error("Not enough valid DEM samples for mesh");
+        }
+
+        geo = new THREE.BufferGeometry();
+        geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+        geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+        geo.setIndex(indices);
+        geo.computeVertexNormals();
+        geo.computeBoundingSphere();
         if (!cancelled) {
-          setHeightMap(null);
-          setColorMap(null);
+          setGeometry(geo);
+          onStatus?.(null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          const msg = err instanceof Error ? err.message : "Mesh failed";
+          setError(msg);
+          onStatus?.(msg);
         }
       }
     }
@@ -260,47 +332,38 @@ function TerrainMesh({
     void run();
     return () => {
       cancelled = true;
-      for (const texture of textures) texture.dispose();
+      geo?.dispose();
     };
-  }, [heightmapUrl, textureUrl, hillshadeUrl]);
+  }, [heightmapUrl, textureUrl, hillshadeUrl, displacementScale, onStatus]);
 
-  const { width, height } = useMemo(() => {
-    const img = heightMap?.image as HTMLImageElement | undefined;
-    return {
-      width: img?.width || 256,
-      height: img?.height || 256,
-    };
-  }, [heightMap]);
-
-  if (!heightMap || !colorMap) return null;
-
-  const aspect = width / Math.max(height, 1);
-  const planeW = 120 * aspect;
-  const planeH = 120;
+  if (error || !geometry) return null;
 
   return (
-    <mesh rotation={[-Math.PI / 2, 0, 0]}>
-      <planeGeometry args={[planeW, planeH, 220, 220]} />
+    <mesh geometry={geometry}>
       <meshStandardMaterial
-        map={colorMap}
-        displacementMap={heightMap}
-        displacementScale={displacementScale}
-        displacementBias={-displacementScale * 0.45}
-        roughness={0.9}
+        vertexColors
+        roughness={0.88}
         metalness={0.02}
+        side={THREE.DoubleSide}
       />
     </mesh>
   );
 }
 
 class SceneErrorBoundary extends Component<
-  { children: ReactNode; fallback: ReactNode },
+  { children: ReactNode; fallback: ReactNode; resetKey?: string },
   { hasError: boolean }
 > {
   state = { hasError: false };
 
   static getDerivedStateFromError() {
     return { hasError: true };
+  }
+
+  componentDidUpdate(prevProps: { resetKey?: string }) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.hasError) {
+      this.setState({ hasError: false });
+    }
   }
 
   render() {
@@ -318,6 +381,7 @@ export function DemTerrainScene({
   mode: modeProp,
 }: DemTerrainProps) {
   const [mode, setMode] = useState<ViewMode>(modeProp ?? "points");
+  const [status, setStatus] = useState<string | null>(null);
 
   if (!heightmapUrl) {
     return (
@@ -329,12 +393,14 @@ export function DemTerrainScene({
 
   const fallback = (
     <div className="flex h-full min-h-[360px] items-center justify-center rounded-xl bg-slate-950 px-4 text-center text-sm text-slate-300">
-      3D point cloud could not load. Check DEM heightmap / hillshade media URLs.
+      3D view could not load. Check DEM heightmap / hillshade media URLs.
     </div>
   );
 
+  const sceneKey = `${mode}|${heightmapUrl}|${textureUrl ?? ""}|${hillshadeUrl ?? ""}|${displacementScale}`;
+
   return (
-    <SceneErrorBoundary fallback={fallback}>
+    <SceneErrorBoundary fallback={fallback} resetKey={sceneKey}>
       <div className="relative h-full min-h-[420px] w-full overflow-hidden rounded-xl bg-[#07111f]">
         <div className="absolute left-3 top-3 z-10 flex gap-1 rounded-lg border border-white/10 bg-black/55 p-1">
           <button
@@ -369,19 +435,21 @@ export function DemTerrainScene({
           <Suspense fallback={null}>
             {mode === "points" ? (
               <PointCloudDem
-                key={`pts|${heightmapUrl}|${textureUrl ?? ""}|${hillshadeUrl ?? ""}|${displacementScale}`}
+                key={`pts|${sceneKey}`}
                 heightmapUrl={heightmapUrl}
                 textureUrl={textureUrl}
                 hillshadeUrl={hillshadeUrl}
                 displacementScale={displacementScale}
+                onStatus={setStatus}
               />
             ) : (
               <TerrainMesh
-                key={`mesh|${heightmapUrl}|${textureUrl ?? ""}|${hillshadeUrl ?? ""}|${displacementScale}`}
+                key={`mesh|${sceneKey}`}
                 heightmapUrl={heightmapUrl}
                 textureUrl={textureUrl}
                 hillshadeUrl={hillshadeUrl}
                 displacementScale={displacementScale}
+                onStatus={setStatus}
               />
             )}
           </Suspense>
@@ -389,8 +457,14 @@ export function DemTerrainScene({
           <OrbitControls makeDefault enableDamping maxPolarAngle={Math.PI / 2.05} />
         </Canvas>
 
+        {status ? (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+            <div className="rounded-md bg-black/65 px-3 py-2 text-xs text-slate-200">{status}</div>
+          </div>
+        ) : null}
+
         <div className="pointer-events-none absolute bottom-3 left-3 rounded-md bg-black/50 px-2 py-1 text-[11px] text-slate-200">
-          3D point cloud · drag to orbit · scroll zoom
+          {mode === "mesh" ? "3D mesh" : "3D point cloud"} · drag to orbit · scroll zoom
           {exaggerationLabel ? ` · ${exaggerationLabel}` : null}
         </div>
       </div>

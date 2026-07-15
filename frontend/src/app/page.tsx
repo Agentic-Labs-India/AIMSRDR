@@ -1,5 +1,5 @@
-import { redirect } from "next/navigation";
+import { PatioReportStudio } from "@/components/survey/patio-report-studio";
 
 export default function HomePage() {
-  redirect("/monitor");
+  return <PatioReportStudio />;
 }

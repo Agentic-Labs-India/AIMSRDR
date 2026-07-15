@@ -66,6 +66,65 @@ export async function fetchProcessJob(siteId: string, jobId: string) {
   return apiFetch<ProcessJobStatus>(`/api/v1/sites/${siteId}/process/${jobId}`);
 }
 
+export type PatioVolumeReportBundle = {
+  ok: boolean;
+  cached?: boolean;
+  site_id: string;
+  survey_id: string;
+  pdf_url: string | null;
+  json_url: string;
+  summary: {
+    total_volume_m3: number;
+    totals_by_patio: Record<string, number>;
+    pile_count: number;
+    source_stage: string;
+  };
+  data: {
+    survey_date_display?: string;
+    patios: Record<
+      string,
+      {
+        total_volume_m3: number;
+        pile_count: number;
+        piles: Array<{
+          name: string;
+          pile_name: string;
+          date_of_survey: string;
+          net_volume_m3: number;
+          enclosed_area_ha: number | null;
+          chainage: string;
+          product: string;
+          morph_class: string;
+          maximum_height_m: number | null;
+          avg_angle_of_repose_deg: number | null;
+        }>;
+      }
+    >;
+  };
+};
+
+export async function fetchPatioVolumeReport(
+  siteId: string,
+  surveyId: string,
+  force = false,
+) {
+  const qs = new URLSearchParams({
+    survey_id: surveyId,
+    force: force ? "true" : "false",
+  });
+  return apiFetch<PatioVolumeReportBundle>(
+    `/api/v1/sites/${siteId}/reports/patio-volumes?${qs}`,
+  );
+}
+
+export function patioVolumePdfUrl(siteId: string, surveyId: string, force = false) {
+  const qs = new URLSearchParams({
+    survey_id: surveyId,
+    force: force ? "true" : "false",
+  });
+  return `${API_BASE}/api/v1/sites/${siteId}/reports/patio-volumes/pdf?${qs}`;
+}
+
 /** @deprecated Prefer startProcessJob + fetchProcessJob for progress UI. */
 export async function reprocessSite(siteId = "nacala-coal-field") {
   return startProcessJob(siteId);

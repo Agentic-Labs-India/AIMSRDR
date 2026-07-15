@@ -1,0 +1,212 @@
+# AIMS RDR — LLM Context Pack (Nacala Coal Patio Volume Detection)
+
+Last updated: 2026-07-15
+Purpose: Give future agents enough ground truth to extend the system without rediscovering failures.
+
+================================================================================
+1. PRODUCT INTENT
+================================================================================
+
+Site: Nacala Port & Coal Field (Mozambique) — coal stockyard, NOT roads.
+Domain language:
+  - patio = parallel storage lane (A / B / C)
+  - pile / stockpile = named feature NC_CYA_P_01 … NC_CYC_P_*
+  - lining material = flat pad (low slope), not a mound
+  - volume detection = loose coal volumes + change over survey dates
+  - Do NOT call features potholes/ruts/heave for this site
+
+Primary deliverable: MatrixGeo-style PDF
+  - Measurement Chainage & Limits overview
+  - CALCULATION OF LOOSE COAL VOLUMES PATIO - A/B/C (table + DEM strip)
+  - L-SECTION STOCKPILE PROFILES (elevation curve + shaded plan)
+
+UI: Next.js monitoring dashboard at /monitor/*
+  - /monitor/parameters = Patio Volumes (Generate PDF)
+
+================================================================================
+2. REPO LAYOUT
+================================================================================
+
+D:\AIMSRDR\
+  docker-compose.yml          # aims-rdr-api on :8000, mounts data/processed/app
+  backend/
+    app/
+      api/routes.py           # health, sites, compare, process, patio report, media
+      services/
+        catalog.py            # survey specs (24 Feb + 3rd March DEM/ortho)
+        raster.py             # DEM/ortho/DoD products
+        processor.py          # process_site jobs
+        volumes.py            # CSV/XLSX volume parsers
+        patio_classify.py     # product + chainage + lining rules
+        patio_report_data.py  # assemble report rows
+        patio_report_figures.py  # CRITICAL: CRS-aware figures
+        patio_report_pdf.py   # ReportLab landscape PDF
+        patio_report.py       # bundle JSON + PDF
+      schemas/
+    data/                     # currently DEM/ortho only under "24 February" / "3rd March"
+    processed/nacala-coal-field/   # generated products + stage JSON/geojson
+    requirements.txt          # includes reportlab, rasterio, pillow, numpy, openpyxl
+  frontend/
+    src/components/survey/monitoring-dashboard.tsx
+    src/components/survey/dem-terrain-scene.tsx
+    src/lib/api.ts
+  skills.md                   # agent playbook
+  llm.txt                     # this file
+
+================================================================================
+3. DATA TRUTH (WHAT EXISTS NOW)
+================================================================================
+
+Raw package (Mozambique_Report_24 Feb SHP/CSV/XLSX) was removed from backend/data.
+Still available in processed/:
+
+  stage-3.json              # 31 named piles + net_volume_m3, areas, elev, properties
+  stage-3-piles.geojson     # polygons NAME=NC_CY*_P_*
+  patio.geojson             # LIMIT PATIO_A/B/C
+  chainage.geojson          # grid features
+  report-24-feb-dem-*.tif/png
+  report-3rd-march-dem-*.tif/png
+  report-24-feb-loose-coal-volumes.pdf
+
+Survey dates wired in catalog:
+  report-24-feb   → data/24 February/dem + ortho
+  report-3rd-march → data/3rd March/dem + ortho
+
+stage-6 piles are mostly unnamed → report builder falls back to stage-3 named inventory
+while still using the selected survey DEM for figures when available.
+
+================================================================================
+4. CRS RULE (MOST IMPORTANT BUG CLASS)
+================================================================================
+
+Pile polygons:  EPSG:32737  (WGS 84 / UTM zone 37S)
+DEM products:   EPSG:21037  (Arc 1960 / UTM zone 37S)
+
+If you sample DEM with polygon XY without warping:
+  - elevation returns nodata (-32767)
+  - L-section graphs are EMPTY grids
+  - plan views are flat grey with only red outlines
+  - patio strips look wrong / similar
+
+Fix location: patio_report_figures.py
+  _PILE_CRS = "EPSG:32737"
+  warp rings with rasterio.warp.transform before from_bounds / sampling
+
+Verification: after warp, NC_CYA_P_02 centroid samples ~16–17 m elev on Feb DEM.
+
+================================================================================
+5. REPORT METRICS
+================================================================================
+
+Table columns (MatrixGeo):
+  Name | Pile Name | Date of Survey | Net Volume (m³) | Enclosed Area (ha)
+  | Chainage | Product | Maximum Height of the Pile | Avg. Angle of Repose
+
+Derived:
+  max_height_m = max_elev_m - min_elev_m
+  avg_angle_repose = properties.AVG_SLOPE_ (shown only for stockpiles)
+  lining if AVG_SLOPE_ < 8° (or near-zero volume pad) → Product "Lining Material",
+    blank height/repose
+  stockpile product grades by height tier → VT4T / MABU / MLVC / Anastasia labels
+
+Chainage:
+  project pile onto patio long axis; 0 at P_01 end; MatrixGeo L-section overrides
+  for known piles (e.g. NC_CYA_P_02 = 360-430)
+
+Volumes (current):
+  stage-3.json net volumes
+  Patio A ≈ 60,783 m³ (sample Final Sheet was 60,843 — close)
+  Patio B ≈ 114,889 m³ (sample Final Sheet 67,926 — different sheet; restore XLSX to match)
+
+================================================================================
+6. FIGURE PIPELINE
+================================================================================
+
+generate_report_figures():
+  overview-measurement-chainage.png  — DEM heatmap + all pile outlines (warped)
+  patio-{A|B|C}-dem-strip.png        — axis-aligned strip per patio, red boxes, chainage 0 on RIGHT
+  lsection-{PILE}.png                — left: red elevation curve; right: hillshade + boundary + centerline
+
+PDF pages (patio_report_pdf.py, landscape A4):
+  1 overview
+  N patio calculation tables + strip
+  L-section pages (2 piles per page)
+  summary
+
+Outputs written to:
+  processed/nacala-coal-field/{survey}-patio-volumes.json
+  processed/nacala-coal-field/{survey}-loose-coal-volumes.pdf
+  processed/nacala-coal-field/reports/patio-volumes-{survey}/figures/*
+
+================================================================================
+7. API
+================================================================================
+
+GET  /api/v1/health
+GET  /api/v1/sites
+GET  /api/v1/sites/{site_id}
+GET  /api/v1/sites/{site_id}/surveys/{survey_id}
+GET  /api/v1/sites/{site_id}/compare?from=&to=
+POST /api/v1/sites/{site_id}/process?async=true
+GET  /api/v1/sites/{site_id}/process/{job_id}
+GET  /api/v1/sites/{site_id}/reports/patio-volumes?survey_id=&force=
+GET  /api/v1/sites/{site_id}/reports/patio-volumes/pdf?survey_id=&force=
+GET  /api/v1/media/{site_id}/{filename}
+
+After code changes to figures: always force=true or delete cached PDF/JSON.
+
+================================================================================
+8. FRONTEND 3D
+================================================================================
+
+dem-terrain-scene.tsx
+  Point cloud + Mesh both built from dem-heightmap.png samples
+  Mesh previously used GPU displacementMap and failed silently → blank
+  Texture: ortho preview preferred; never use elevation heatmap as “true color”
+
+================================================================================
+9. DEPENDENCIES / RUNTIME
+================================================================================
+
+API container: ghcr.io/osgeo/gdal:ubuntu-small-3.8.3 + venv
+Python deps: fastapi, rasterio, numpy, pillow, reportlab, openpyxl, pyshp
+Frontend: Next.js 16, React 19, three / @react-three/fiber / drei, bun/npm
+
+ECW ortho: Docker GDAL has no ECW driver. Convert on host with QGIS:
+  scripts/convert_ortho_ecw.ps1 → *-ortho-rgb.tif in processed/
+
+================================================================================
+10. KNOWN GAPS / NEXT WORK
+================================================================================
+
+- Restore Final Calculation XLSX for exact MatrixGeo product + volume match
+- Per-date named piles for March (stage-6) for true volume change tables
+- Optional mass (tonnes) column when sheet present
+- Change PDF page: Feb vs March per-pile Δvolume
+- Ortho+RGB dual strip page like MatrixGeo “Top View of Coal yard”
+- Persist reportlab in image rebuild: docker compose up --build
+
+================================================================================
+11. QUICK REGENERATE
+================================================================================
+
+docker compose up -d
+docker exec -e PYTHONPATH=/app aims-rdr-api python -c "
+from app.config import get_settings
+from app.services.patio_report import generate_patio_volume_report_bundle
+b=generate_patio_volume_report_bundle(get_settings(),'nacala-coal-field','report-24-feb',build_pdf=True)
+print(b['pdf_path'], b['data']['figures'].get('errors'))
+"
+
+Frontend: http://localhost:3000/monitor/parameters → Generate PDF
+
+================================================================================
+12. ACCEPTANCE CHECKS
+================================================================================
+
+[ ] Patio A/B/C DEM strips are visually different
+[ ] L-section left panel shows a continuous red elevation curve with Elev(m)/Dist(m) labels
+[ ] L-section right panel shows hillshade relief under the pile, not flat grey
+[ ] Table totals match stage-3 named pile sums
+[ ] No pothole terminology on Patio Volumes UI
+[ ] CRS warp used for all DEM figure sampling
