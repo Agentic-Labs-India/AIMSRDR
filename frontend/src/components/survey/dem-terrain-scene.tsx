@@ -61,6 +61,15 @@ function sampleImageData(img: HTMLImageElement): ImageData {
   return ctx.getImageData(0, 0, canvas.width, canvas.height);
 }
 
+/**
+ * Heightmap encoding: byte 0 = nodata; bytes 1..255 = full elev min→max.
+ * Matches backend `_normalize_heightmap_uint8`.
+ */
+function heightByteTo01(elevByte: number): number | null {
+  if (elevByte < 1) return null;
+  return (elevByte - 1) / 254;
+}
+
 /** Natural site colors (soil / coal / concrete), not a rainbow heatmap. */
 function naturalColor(height01: number, shade01: number, tex?: [number, number, number]) {
   if (tex) {
@@ -135,11 +144,10 @@ function PointCloudDem({
         for (let y = 0; y < h; y += step) {
           for (let x = 0; x < w; x += step) {
             const i = (y * w + x) * 4;
-            const elevByte = height.data[i];
-            // Nodata / empty background in our heightmaps is near black.
-            if (elevByte < 3) continue;
+            const height01 = heightByteTo01(height.data[i]);
+            // Nodata / empty background in our heightmaps is byte 0.
+            if (height01 == null) continue;
 
-            const height01 = elevByte / 255;
             const shade01 = shade ? shade.data[i] / 255 : 0.65 + 0.35 * height01;
             const u = x / (w - 1);
             const v = y / (h - 1);
@@ -263,8 +271,8 @@ function TerrainMesh({
             const x = Math.min(w - 1, Math.floor(u * (w - 1)));
             const y = Math.min(h - 1, Math.floor(v * (h - 1)));
             const pi = (y * w + x) * 4;
-            const elevByte = height.data[pi];
-            const height01 = elevByte < 3 ? 0 : elevByte / 255;
+            const mapped = heightByteTo01(height.data[pi]);
+            const height01 = mapped ?? 0;
             elevGrid.push(height01);
 
             const px = (u - 0.5) * planeW;

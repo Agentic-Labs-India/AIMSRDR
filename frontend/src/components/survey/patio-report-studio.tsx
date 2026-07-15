@@ -312,10 +312,15 @@ function UploadDashboard({
     exaggeration,
   });
 
-  const heightmap = mediaUrl(rasters?.dem_heightmap_url) || "";
+  // Bust browser cache after heightmap encoding change (full min–max, not p98 clip).
+  const bust = (url: string | null | undefined, tag: string) => {
+    if (!url) return "";
+    return `${url}${url.includes("?") ? "&" : "?"}v=${tag}`;
+  };
+  const heightmap = bust(mediaUrl(rasters?.dem_heightmap_url), "hm-minmax");
   const hillshade = mediaUrl(rasters?.dem_hillshade_url);
-  const demRgb = mediaUrl(rasters?.dem_rgb_url);
-  const demPreview = mediaUrl(rasters?.dem_preview_url);
+  const demRgb = bust(mediaUrl(rasters?.dem_rgb_url), "hm-minmax");
+  const demPreview = bust(mediaUrl(rasters?.dem_preview_url), "hm-minmax");
   const pdfHref = mediaUrl(result.pdf_url);
 
   return (

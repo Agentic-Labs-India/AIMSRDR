@@ -194,6 +194,7 @@ def _read_band(path: Path, *, mask_elevations: bool = True) -> tuple[np.ndarray,
 
 
 def _normalize_uint8(arr: np.ndarray, p_low: float = 2, p_high: float = 98) -> np.ndarray:
+    """Percentile contrast stretch (previews / ortho). May clip extremes — do not use for 3D height."""
     data = np.asarray(arr, dtype=np.float32)
     valid = data[np.isfinite(data)]
     if valid.size == 0:
@@ -207,16 +208,40 @@ def _normalize_uint8(arr: np.ndarray, p_low: float = 2, p_high: float = 98) -> n
     return np.nan_to_num(scaled * 255.0, nan=0.0, posinf=255.0, neginf=0.0).astype(np.uint8)
 
 
+def _normalize_heightmap_uint8(arr: np.ndarray) -> np.ndarray:
+    """
+    Full-range elevation → uint8 for 3D displacement.
+
+    Uses true min/max of valid samples so pile peaks are not flattened.
+    Byte 0 is reserved for nodata (frontend skips near-black samples).
+    Valid elevations map to 1..255.
+    """
+    data = np.asarray(arr, dtype=np.float32)
+    valid = np.isfinite(data)
+    out = np.zeros(data.shape, dtype=np.uint8)
+    if not np.any(valid):
+        return out
+    vals = data[valid]
+    lo = float(np.min(vals))
+    hi = float(np.max(vals))
+    if math.isclose(lo, hi):
+        hi = lo + 1.0
+    scaled = (vals - lo) / (hi - lo)
+    out[valid] = (np.clip(np.rint(scaled * 254.0), 0, 254) + 1).astype(np.uint8)
+    return out
+
+
 def _elevation_color(arr: np.ndarray) -> np.ndarray:
-    """Terrain RGB ramp: deep blue → teal → green → yellow → red."""
-    gray = _normalize_uint8(arr)
-    x = gray.astype(np.float32) / 255.0
+    """Terrain RGB ramp: deep blue → teal → green → yellow → red (full elev range)."""
+    gray = _normalize_heightmap_uint8(arr)
+    # Map 1..255 → 0..1 for the ramp; keep nodata (0) dark via mask below.
+    x = np.clip((gray.astype(np.float32) - 1.0) / 254.0, 0, 1)
     r = np.clip(1.55 * x - 0.15, 0, 1)
     g = np.clip(1.25 - abs(x - 0.42) * 2.1, 0, 1)
     b = np.clip(1.15 - x * 1.35, 0, 1)
     rgb = np.dstack([r, g, b])
     rgb = (rgb * 255).astype(np.uint8)
-    mask = ~np.isfinite(arr)
+    mask = ~np.isfinite(arr) | (gray == 0)
     rgb[mask] = (15, 23, 42)
     return rgb
 
@@ -294,7 +319,7 @@ def process_dem(dem_path: Path, out_dir: Path, survey_id: str, max_dim: int = 15
         meta["valid_pixel_share"] = float(valid.size / arr.size)
 
     elev_rgb = _elevation_color(arr)
-    Image.fromarray(_normalize_uint8(arr), mode="L").save(heightmap, optimize=True)
+    Image.fromarray(_normalize_heightmap_uint8(arr), mode="L").save(heightmap, optimize=True)
 
     # Hillshade via gdaldem when available
     hs_u8: np.ndarray
